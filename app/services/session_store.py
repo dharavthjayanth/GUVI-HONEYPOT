@@ -59,3 +59,17 @@ class InMemorySessionStore:
 
     def get(self, session_id: str) -> Optional[SessionState]:
         return self._store.get(session_id)
+    
+    def merge_intelligence(self, s: SessionState, intel: dict) -> None:
+        """
+        Merge extracted intel into the session's extracted_intelligence dict (dedupe).
+        """
+        for key in ["bankAccounts", "upiIds", "phishingLinks", "phoneNumbers", "suspiciousKeywords"]:
+            existing = s.extracted_intelligence.get(key, [])
+            for item in intel.get(key, []):
+                if item and item not in existing:
+                    existing.append(item)
+            s.extracted_intelligence[key] = existing
+
+        self.update_timestamp(s)
+
