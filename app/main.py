@@ -90,3 +90,19 @@ def global_exception_handler(request, exc: Exception):
         status_code=200,
         content={"status": "error", "reply": "Sorry, I didn’t understand. Can you repeat that?"},
     )
+
+@app.get("/debug/session/{session_id}")
+def debug_session(session_id: str, _: None = Depends(require_api_key)):
+    s = store.get(session_id)
+    if not s:
+        return {"found": False, "sessionId": session_id}
+
+    return {
+        "found": True,
+        "sessionId": s.session_id,
+        "scamDetected": s.scam_detected,
+        "riskScore": s.risk_score,
+        "matchedSignals": s.matched_signals,
+        "totalMessagesExchanged": s.total_messages_exchanged,
+        "extractedIntelligence": s.extracted_intelligence,
+    }
