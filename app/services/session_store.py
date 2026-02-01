@@ -32,6 +32,7 @@ class SessionState:
     agent_notes: str = ""
     status: str = "ACTIVE"  # ACTIVE / COMPLETED
     callback_sent: bool = False
+    callback_attempts: int = 0
 
 
 class InMemorySessionStore:
@@ -72,4 +73,29 @@ class InMemorySessionStore:
             s.extracted_intelligence[key] = existing
 
         self.update_timestamp(s)
+    def should_finalize(self, s) -> bool:
+        """
+        Decide if we should send the GUVI final callback.
+        Rules:
+        - Scam detected
+        - Not already sent
+        - Has at least one high-value intel: UPI OR link OR phone OR bank account
+        - Enough engagement (min messages)
+        """
+        if s.callback_sent:
+            return False
+        if not s.scam_detected:
+            return False
+
+        has_high_value = bool(
+            s.extracted_intelligence.get("upiIds")
+            or s.extracted_intelligence.get("phishingLinks")
+            or s.extracted_intelligence.get("phoneNumbers")
+            or s.extracted_intelligence.get("bankAccounts")
+        )
+
+        # you can tune this later (2 is good for “engagement depth”)
+        min_turns = 2
+        return has_high_value and s.total_messages_exchanged >= min_turns
+
 

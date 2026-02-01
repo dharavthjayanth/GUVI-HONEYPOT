@@ -1,6 +1,6 @@
 # app/main.py
 import logging
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from app.models import HoneypotRequest, HoneypotResponse
@@ -9,12 +9,12 @@ from app.utils.auth import require_api_key
 from app.services.session_store import InMemorySessionStore
 from app.services.scam_detector import detect_scam
 from app.services.extractor import extract_intelligence
+from app.services.callback import send_guvi_final_result, build_agent_notes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("honeypot")
 
-app = FastAPI(title="Agentic Honeypot API", version="0.3.0")
-
+app = FastAPI(title="Agentic Honeypot API", version="0.4.0")
 store = InMemorySessionStore()
 
 
@@ -24,15 +24,11 @@ def health():
 
 
 @app.post("/honeypot", response_model=HoneypotResponse)
-def honeypot_endpoint(payload: HoneypotRequest, _: None = Depends(require_api_key)):
-    """
-    Day-3 behavior:
-    - Session memory per sessionId
-    - Scam risk scoring
-    - Intelligence extraction (UPI/phone/links/accounts/keywords)
-    - Still returns ONLY {status, reply} (evaluator-safe)
-    """
-
+def honeypot_endpoint(
+    payload: HoneypotRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(require_api_key),
+):
     session_id = payload.sessionId
     latest_msg = payload.message
 
@@ -56,27 +52,56 @@ def honeypot_endpoint(payload: HoneypotRequest, _: None = Depends(require_api_ke
     if scam_now:
         session.scam_detected = True
 
-    # -------- Intelligence extraction (Day 3) --------
-    # Extract primarily from scammer messages (more signal), but history may include links too.
-    # We'll extract from latest message always; plus history if session is still small.
+    # -------- Intelligence extraction --------
     intel_latest = extract_intelligence(latest_msg.text)
     store.merge_intelligence(session, intel_latest)
 
-    # Optional: early turns extract from conversationHistory too (only once / small)
+    # Optional: early turns extract from history too (small boost)
     if len(session.conversation) <= 6 and payload.conversationHistory:
         combined = "\n".join([m.text for m in payload.conversationHistory if m.sender == "scammer"])
         if combined.strip():
-            intel_hist = extract_intelligence(combined)
-            store.merge_intelligence(session, intel_hist)
+            store.merge_intelligence(session, extract_intelligence(combined))
+
+    # -------- Day 4: Final callback trigger --------
+    # Send callback only when we have enough engagement + high-value intel
+    if store.should_finalize(session):
+        agent_notes = build_agent_notes(
+            matched_signals=session.matched_signals,
+            extracted=session.extracted_intelligence,
+        )
+
+        # Mark as attempted to avoid duplicate spamming on fast repeated calls
+        session.callback_attempts += 1
+
+        def _send_callback():
+            ok = send_guvi_final_result(
+                session_id=session.session_id,
+                scam_detected=True,
+                total_messages_exchanged=session.total_messages_exchanged,
+                extracted_intelligence=session.extracted_intelligence,
+                agent_notes=agent_notes,
+            )
+            if ok:
+                session.callback_sent = True
+                session.status = "COMPLETED"
+
+        # Run callback after response (keeps /honeypot fast)
+        background_tasks.add_task(_send_callback)
 
     # -------- Reply strategy --------
-    # Keep human-like; do not reveal detection.
+    # Keep human-like and never reveal detection.
     if session.scam_detected:
-        # Ask 1–2 things; do NOT ask everything at once (keeps engagement going)
-        reply = (
-            "I’m worried. Which bank is this for? Also, can you share the official link or reference number "
-            "from the message so I can confirm?"
-        )
+        # Ask 1–2 things at a time (keeps engagement longer)
+        if session.extracted_intelligence.get("phishingLinks"):
+            reply = (
+                "I got the link. Before I click, can you confirm the official bank name and the reference number? "
+                "Also, what exactly will happen if I don’t do it today?"
+            )
+        else:
+            reply = (
+                "I’m worried. Which bank is this for? Can you share the official link or reference number from the message "
+                "so I can confirm?"
+            )
     else:
         reply = "Okay. Can you share more details?"
 
@@ -90,19 +115,3 @@ def global_exception_handler(request, exc: Exception):
         status_code=200,
         content={"status": "error", "reply": "Sorry, I didn’t understand. Can you repeat that?"},
     )
-
-@app.get("/debug/session/{session_id}")
-def debug_session(session_id: str, _: None = Depends(require_api_key)):
-    s = store.get(session_id)
-    if not s:
-        return {"found": False, "sessionId": session_id}
-
-    return {
-        "found": True,
-        "sessionId": s.session_id,
-        "scamDetected": s.scam_detected,
-        "riskScore": s.risk_score,
-        "matchedSignals": s.matched_signals,
-        "totalMessagesExchanged": s.total_messages_exchanged,
-        "extractedIntelligence": s.extracted_intelligence,
-    }
