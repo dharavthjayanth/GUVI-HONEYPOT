@@ -29,8 +29,9 @@ def honeypot_endpoint(
     background_tasks: BackgroundTasks,
     _: None = Depends(require_api_key),
 ):
-    session_id = payload.sessionId
-    latest_msg = payload.message
+    session_id = payload.normalized_session_id()
+    latest_msg = payload.normalized_message()
+
 
     logger.info(f"sessionId={session_id} sender={latest_msg.sender} text={latest_msg.text[:120]}")
 

@@ -1,29 +1,51 @@
-from typing import List, Literal, Optional
+# app/models.py
+from __future__ import annotations
 from pydantic import BaseModel, Field
-
-
-SenderType = Literal["scammer", "user"]
+from typing import List, Optional, Literal, Any, Dict
 
 
 class Message(BaseModel):
-    sender: SenderType
-    text: str = Field(..., min_length=1, max_length=5000)
-    timestamp: str = Field(..., description="ISO-8601 timestamp string")
+    sender: Literal["scammer", "user"]
+    text: str
+    timestamp: str
 
 
 class Metadata(BaseModel):
-    channel: Optional[str] = None       # SMS / WhatsApp / Email / Chat
-    language: Optional[str] = None      # English / Hindi / etc.
-    locale: Optional[str] = None        # IN / etc.
+    channel: Optional[str] = None
+    language: Optional[str] = None
+    locale: Optional[str] = None
 
 
 class HoneypotRequest(BaseModel):
-    sessionId: str = Field(..., min_length=3, max_length=128)
-    message: Message
+    # Some testers may send session_id instead of sessionId
+    sessionId: Optional[str] = None
+    session_id: Optional[str] = None
+
+    # Some testers may send "message" correctly, or send it as "incomingMessage"
+    message: Optional[Message] = None
+    incomingMessage: Optional[Message] = None
+
+    # Some testers may omit this field
     conversationHistory: List[Message] = Field(default_factory=list)
+
     metadata: Optional[Metadata] = None
+
+    # Allow extra fields without failing
+    class Config:
+        extra = "allow"
+
+    def normalized_session_id(self) -> str:
+        return self.sessionId or self.session_id or "unknown-session"
+
+    def normalized_message(self) -> Message:
+        if self.message:
+            return self.message
+        if self.incomingMessage:
+            return self.incomingMessage
+        # fallback (should not happen if tester sends something)
+        return Message(sender="scammer", text="", timestamp="1970-01-01T00:00:00Z")
 
 
 class HoneypotResponse(BaseModel):
-    status: Literal["success", "error"]
+    status: str
     reply: str
