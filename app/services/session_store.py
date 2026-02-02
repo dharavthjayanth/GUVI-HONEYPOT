@@ -106,6 +106,7 @@ class InMemorySessionStore:
         s.conversation.append({"sender": sender, "text": text, "timestamp": timestamp})
         s.total_messages_exchanged += 1
         self.update_timestamp(s)
+    
 
 
 
