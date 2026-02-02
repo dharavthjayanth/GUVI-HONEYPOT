@@ -37,7 +37,7 @@ def send_guvi_final_result(
     extracted_intelligence: Dict[str, list[str]],
     agent_notes: str,
     timeout_seconds: int = 5,
-    max_retries: int = 3,
+    max_retries: int = 2,
 ) -> bool:
     """
     Sends the mandatory final callback to GUVI.

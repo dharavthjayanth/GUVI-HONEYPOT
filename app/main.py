@@ -58,10 +58,11 @@ def _safe_dict(value: Any) -> Dict[str, Any]:
 
 @app.post("/honeypot")
 def honeypot_endpoint(
-    payload: Dict[str, Any] = Body(default_factory=dict),  # ✅ accepts any JSON object
-    background_tasks: BackgroundTasks = None,
+    background_tasks: BackgroundTasks,                 # ✅ no default
+    payload: Dict[str, Any] = Body(default_factory=dict),
     _: None = Depends(require_api_key),
 ):
+
     """
     GUVI-tester-safe endpoint:
     - Accepts ANY JSON body (avoids 422)
@@ -136,11 +137,8 @@ def honeypot_endpoint(
                 session.status = "COMPLETED"
 
         # Non-blocking callback (keeps API fast)
-        if background_tasks is not None:
-            background_tasks.add_task(_send_callback)
-        else:
-            # fallback (rare)
-            _send_callback()
+        background_tasks.add_task(_send_callback)
+
 
     # ---- Reply strategy (policy-based) ----
     if session.scam_detected:
