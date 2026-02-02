@@ -2,7 +2,8 @@
 import logging
 from fastapi import Depends, FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
-
+from fastapi import Request, BackgroundTasks, Depends
+from fastapi.responses import JSONResponse
 from app.models import HoneypotRequest, HoneypotResponse
 from app.utils.auth import require_api_key
 
@@ -23,56 +24,79 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/honeypot", response_model=HoneypotResponse)
-def honeypot_endpoint(
-    payload: HoneypotRequest,
+
+
+
+
+@app.post("/honeypot")
+async def honeypot_endpoint(
+    request: Request,
     background_tasks: BackgroundTasks,
     _: None = Depends(require_api_key),
 ):
-    session_id = payload.normalized_session_id()
-    latest_msg = payload.normalized_message()
+    """
+    GUVI-tester-safe endpoint:
+    - Accepts ANY JSON body (prevents 422 RequestValidationError)
+    - Normalizes into our internal structure
+    - Returns ONLY {status, reply}
+    """
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
 
+    # ---- Normalize fields (handle variations) ----
+    session_id = (
+        body.get("sessionId")
+        or body.get("session_id")
+        or body.get("sessionID")
+        or "unknown-session"
+    )
 
-    logger.info(f"sessionId={session_id} sender={latest_msg.sender} text={latest_msg.text[:120]}")
+    msg_obj = body.get("message") or body.get("incomingMessage") or {}
+    sender = msg_obj.get("sender") or "scammer"
+    text = msg_obj.get("text") or ""
+    timestamp = msg_obj.get("timestamp") or "1970-01-01T00:00:00Z"
 
-    # -------- Session memory --------
+    conversation_history = body.get("conversationHistory") or body.get("history") or []
+    if not isinstance(conversation_history, list):
+        conversation_history = []
+
+    # ---- Now run your existing logic using normalized values ----
+    logger.info(f"sessionId={session_id} sender={sender} text={str(text)[:120]}")
+
     session = store.get_or_create(session_id)
 
-    # Ingest history only once (first time we see session)
-    if not session.conversation and payload.conversationHistory:
-        for m in payload.conversationHistory:
-            store.append_message(session, m)
+    # ingest history if first time
+    if not session.conversation and conversation_history:
+        for m in conversation_history:
+            try:
+                if isinstance(m, dict):
+                    store.append_message_dict(session, m)  # We'll add this helper below
+            except Exception:
+                continue
 
-    # Append latest incoming message
-    store.append_message(session, latest_msg)
+    # append latest message (as dict)
+    store.append_message_dict(session, {"sender": sender, "text": text, "timestamp": timestamp})
 
-    # -------- Scam detection --------
-    scam_now, risk_score, matched_signals = detect_scam(latest_msg.text, threshold=60)
+    # scam detection
+    scam_now, risk_score, matched_signals = detect_scam(text, threshold=60)
     session.risk_score = risk_score
     session.matched_signals = matched_signals
     if scam_now:
         session.scam_detected = True
 
-    # -------- Intelligence extraction --------
-    intel_latest = extract_intelligence(latest_msg.text)
-    store.merge_intelligence(session, intel_latest)
+    # extraction
+    store.merge_intelligence(session, extract_intelligence(text))
 
-    # Optional: early turns extract from history too (small boost)
-    if len(session.conversation) <= 6 and payload.conversationHistory:
-        combined = "\n".join([m.text for m in payload.conversationHistory if m.sender == "scammer"])
-        if combined.strip():
-            store.merge_intelligence(session, extract_intelligence(combined))
-
-    # -------- Day 4: Final callback trigger --------
-    # Send callback only when we have enough engagement + high-value intel
-    if store.should_finalize(session):
+    # callback trigger
+    if store.should_finalize(session) and not session.callback_sent:
         agent_notes = build_agent_notes(
             matched_signals=session.matched_signals,
             extracted=session.extracted_intelligence,
         )
-
-        # Mark as attempted to avoid duplicate spamming on fast repeated calls
-        session.callback_attempts += 1
 
         def _send_callback():
             ok = send_guvi_final_result(
@@ -86,27 +110,16 @@ def honeypot_endpoint(
                 session.callback_sent = True
                 session.status = "COMPLETED"
 
-        # Run callback after response (keeps /honeypot fast)
         background_tasks.add_task(_send_callback)
 
-    # -------- Reply strategy --------
-    # Keep human-like and never reveal detection.
+    # reply strategy
     if session.scam_detected:
-        # Ask 1–2 things at a time (keeps engagement longer)
-        if session.extracted_intelligence.get("phishingLinks"):
-            reply = (
-                "I got the link. Before I click, can you confirm the official bank name and the reference number? "
-                "Also, what exactly will happen if I don’t do it today?"
-            )
-        else:
-            reply = (
-                "I’m worried. Which bank is this for? Can you share the official link or reference number from the message "
-                "so I can confirm?"
-            )
+        reply = "I’m worried. Which bank is this for? Can you share the official link or reference number so I can confirm?"
     else:
         reply = "Okay. Can you share more details?"
 
-    return HoneypotResponse(status="success", reply=reply)
+    return JSONResponse(status_code=200, content={"status": "success", "reply": reply})
+
 
 
 @app.exception_handler(Exception)

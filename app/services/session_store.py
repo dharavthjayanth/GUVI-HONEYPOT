@@ -97,5 +97,15 @@ class InMemorySessionStore:
         # you can tune this later (2 is good for “engagement depth”)
         min_turns = 2
         return has_high_value and s.total_messages_exchanged >= min_turns
+    def append_message_dict(self, s, m: dict) -> None:
+        sender = m.get("sender", "scammer")
+        text = m.get("text", "")
+        timestamp = m.get("timestamp", "1970-01-01T00:00:00Z")
+        # reuse your existing append_message logic if it expects a Message object,
+        # otherwise store dicts consistently.
+        s.conversation.append({"sender": sender, "text": text, "timestamp": timestamp})
+        s.total_messages_exchanged += 1
+        self.update_timestamp(s)
+
 
 
