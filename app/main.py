@@ -55,6 +55,18 @@ def _safe_list(value: Any) -> List[Any]:
 def _safe_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
+@app.get("/honeypot")
+def honeypot_get():
+    # GUVI tester preflight check
+    return {"status": "success", "reply": "Honeypot endpoint is active"}
+
+@app.head("/honeypot")
+def honeypot_head():
+    # Must return 200 with no body or JSON-safe response
+    return JSONResponse(
+        status_code=200,
+        content={"status": "success", "reply": "ok"}
+    )
 
 @app.post("/honeypot")
 def honeypot_endpoint(
