@@ -5,6 +5,8 @@ from typing import Any, Dict, List
 from fastapi import BackgroundTasks, Body, Depends, FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 
 from app.utils.auth import require_api_key
 from app.services.session_store import InMemorySessionStore
@@ -15,9 +17,43 @@ from app.services.callback import send_guvi_final_result, build_agent_notes
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("honeypot")
 
-app = FastAPI(title="Agentic Honeypot API", version="0.4.2")
-
+app = FastAPI(title="Agentic Honeypot API", version="0.4.4")
 store = InMemorySessionStore()
+
+
+# ----------------------------
+# Middleware: Make HEAD /honeypot behave like GET (tester-safe)
+# GUVI tester does HEAD/GET pre-check and tries to JSON-parse responses.
+# HEAD normally has no body, which breaks naive testers.
+# So we rewrite HEAD /honeypot -> GET /honeypot internally.
+# ----------------------------
+class HeadToGetForTester(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "HEAD" and request.url.path == "/honeypot":
+            request.scope["method"] = "GET"
+        return await call_next(request)
+
+
+app.add_middleware(HeadToGetForTester)
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def _safe_list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _safe_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+# ----------------------------
+# Basic routes
+# ----------------------------
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
 
 @app.get("/health")
@@ -25,7 +61,10 @@ def health():
     return {"status": "ok"}
 
 
-# Safety net: If any validation happens elsewhere, never return 422 to tester.
+# ----------------------------
+# Validation safety nets
+# Never return 422 to GUVI tester
+# ----------------------------
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
     logger.warning(f"RequestValidationError intercepted: {exc}")
@@ -38,7 +77,6 @@ async def validation_exception_handler(request, exc):
     )
 
 
-# Optional: keep your global exception handler
 @app.exception_handler(Exception)
 def global_exception_handler(request, exc: Exception):
     logger.exception(f"Unhandled error: {exc}")
@@ -48,42 +86,38 @@ def global_exception_handler(request, exc: Exception):
     )
 
 
-def _safe_list(value: Any) -> List[Any]:
-    return value if isinstance(value, list) else []
-
-
-def _safe_dict(value: Any) -> Dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
+# ----------------------------
+# GUVI tester pre-check route
+# IMPORTANT: This GET must be PUBLIC (no API key), because some testers
+# do a preflight GET/HEAD without headers.
+# Response must be valid JSON with required fields: status, reply.
+# ----------------------------
 @app.get("/honeypot")
-def honeypot_get():
-    # GUVI tester preflight check
+def honeypot_get_probe():
     return {"status": "success", "reply": "Honeypot endpoint is active"}
 
-@app.head("/honeypot")
-def honeypot_head():
-    # Must return 200 with no body or JSON-safe response
-    return JSONResponse(
-        status_code=200,
-        content={"status": "success", "reply": "ok"}
-    )
 
+# ----------------------------
+# Main Honeypot endpoint (POST) - secured with API key
+# Accept ANY JSON body to avoid INVALID_REQUEST_BODY issues.
+# ----------------------------
 @app.post("/honeypot")
 def honeypot_endpoint(
-    background_tasks: BackgroundTasks,                 # ✅ no default
+    background_tasks: BackgroundTasks,
     payload: Dict[str, Any] = Body(default_factory=dict),
     _: None = Depends(require_api_key),
 ):
-
     """
-    GUVI-tester-safe endpoint:
-    - Accepts ANY JSON body (avoids 422)
-    - Normalizes fields (sessionId/message/history variations)
-    - Runs Day 2–4 logic (memory, detection, extraction, callback)
-    - Returns ONLY {status, reply}
+    Agentic honeypot:
+    - Accepts any JSON (tester-safe)
+    - Maintains session memory
+    - Computes scam risk + matched signals
+    - Extracts intelligence (UPI/phones/links/etc.)
+    - Triggers GUVI final callback asynchronously
+    - Returns only {status, reply}
     """
 
-    # ---- Normalize fields ----
+    # ---- Normalize fields (handle variations) ----
     session_id = (
         payload.get("sessionId")
         or payload.get("session_id")
@@ -94,9 +128,14 @@ def honeypot_endpoint(
     msg = _safe_dict(payload.get("message") or payload.get("incomingMessage") or payload.get("incoming_message"))
     sender = msg.get("sender") or "scammer"
     text = msg.get("text") or ""
-    timestamp = msg.get("timestamp") or "1970-01-01T00:00:00Z"
+    # timestamp might be ISO string or epoch ms; keep as string
+    timestamp = str(msg.get("timestamp") or "1970-01-01T00:00:00Z")
 
-    history = _safe_list(payload.get("conversationHistory") or payload.get("conversation_history") or payload.get("history"))
+    history = _safe_list(
+        payload.get("conversationHistory")
+        or payload.get("conversation_history")
+        or payload.get("history")
+    )
 
     logger.info(f"sessionId={session_id} sender={sender} text={str(text)[:120]}")
 
@@ -106,9 +145,8 @@ def honeypot_endpoint(
     # Ingest history only once (first time we see session)
     if not session.conversation and history:
         for m in history:
-            if not isinstance(m, dict):
-                continue
-            store.append_message_dict(session, m)
+            if isinstance(m, dict):
+                store.append_message_dict(session, m)
 
     # Append latest incoming message
     store.append_message_dict(session, {"sender": sender, "text": text, "timestamp": timestamp})
@@ -123,14 +161,16 @@ def honeypot_endpoint(
     # ---- Intelligence extraction ----
     store.merge_intelligence(session, extract_intelligence(text))
 
-    # Also extract from scammer history early (small boost)
+    # Early boost: extract from scammer history too
     if len(session.conversation) <= 6 and history:
-        combined = "\n".join([m.get("text", "") for m in history if isinstance(m, dict) and m.get("sender") == "scammer"])
+        combined = "\n".join(
+            [m.get("text", "") for m in history if isinstance(m, dict) and m.get("sender") == "scammer"]
+        )
         if combined.strip():
             store.merge_intelligence(session, extract_intelligence(combined))
 
-    # ---- Day 4: Final callback trigger ----
-    if store.should_finalize(session) and not session.callback_sent:
+    # ---- Day 4: Final callback trigger (async) ----
+    if store.should_finalize(session) and not getattr(session, "callback_sent", False):
         agent_notes = build_agent_notes(
             matched_signals=session.matched_signals,
             extracted=session.extracted_intelligence,
@@ -143,16 +183,16 @@ def honeypot_endpoint(
                 total_messages_exchanged=session.total_messages_exchanged,
                 extracted_intelligence=session.extracted_intelligence,
                 agent_notes=agent_notes,
+                timeout_seconds=5,
+                max_retries=2,
             )
             if ok:
                 session.callback_sent = True
                 session.status = "COMPLETED"
 
-        # Non-blocking callback (keeps API fast)
         background_tasks.add_task(_send_callback)
 
-
-    # ---- Reply strategy (policy-based) ----
+    # ---- Reply strategy (policy-based, safe) ----
     if session.scam_detected:
         if session.extracted_intelligence.get("phishingLinks"):
             reply = (
@@ -170,7 +210,9 @@ def honeypot_endpoint(
     return JSONResponse(status_code=200, content={"status": "success", "reply": reply})
 
 
-# -------- Debug endpoint (keep until final day; API-key protected) --------
+# ----------------------------
+# Debug endpoint (keep until final day) - API key protected
+# ----------------------------
 @app.get("/debug/session/{session_id}")
 def debug_session(session_id: str, _: None = Depends(require_api_key)):
     s = store.get(session_id)
